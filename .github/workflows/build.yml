@@ -1,0 +1,1203 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+      - name: Tulis proyek Pixel Panel
+        run: |
+          mkdir -p app/src/main/java/com/pixelpanel app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle.kts <<'PP_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PixelPanel"
+          include(":app")
+          PP_EOF
+          cat > build.gradle.kts <<'PP_EOF'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          PP_EOF
+          cat > gradle.properties <<'PP_EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          PP_EOF
+          cat > app/build.gradle.kts <<'PP_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.pixelpanel"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.pixelpanel"
+                  minSdk = 24
+                  targetSdk = 33
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          PP_EOF
+          cat > app/src/main/AndroidManifest.xml <<'PP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Pixel Panel"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".PickActivity"
+                      android:excludeFromRecents="true"
+                      android:exported="false"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false" />
+
+                  <service
+                      android:name=".TapService"
+                      android:exported="false"
+                      android:label="Pixel Panel Auto Shoot"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          PP_EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'PP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/access_desc"
+              android:notificationTimeout="100" />
+          PP_EOF
+          cat > app/src/main/res/values/strings.xml <<'PP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="access_desc">Dipakai Pixel Panel untuk melakukan tap otomatis (Auto Shoot) di titik yang kamu tentukan sendiri.</string>
+          </resources>
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/Prefs.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("pp", Context.MODE_PRIVATE)
+
+              fun bool(c: Context, k: String, d: Boolean): Boolean = sp(c).getBoolean(k, d)
+
+              fun int(c: Context, k: String, d: Int): Int = sp(c).getInt(k, d)
+
+              fun put(c: Context, k: String, v: Boolean) {
+                  sp(c).edit().putBoolean(k, v).apply()
+              }
+
+              fun put(c: Context, k: String, v: Int) {
+                  sp(c).edit().putInt(k, v).apply()
+              }
+          }
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/CursorView.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.view.View
+
+          object CursorShapes {
+              const val COUNT = 8
+
+              fun draw(c: Canvas, style: Int, color: Int, w: Float, h: Float) {
+                  val cx = w / 2f
+                  val cy = h / 2f
+                  val r = minOf(w, h) / 2f * 0.9f
+                  val sw = maxOf(2f, minOf(w, h) * 0.06f)
+                  // pass 0 = garis luar hitam (biar kelihatan di latar terang), pass 1 = warna asli
+                  for (pass in 0..1) {
+                      val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                      p.style = Paint.Style.STROKE
+                      p.strokeCap = Paint.Cap.ROUND
+                      p.strokeWidth = if (pass == 0) sw + 3f else sw
+                      p.color = if (pass == 0) Color.argb(200, 0, 0, 0) else color
+                      shape(c, style, p, cx, cy, r)
+                  }
+              }
+
+              private fun shape(c: Canvas, s: Int, p: Paint, cx: Float, cy: Float, r: Float) {
+                  when (s) {
+                      0 -> {
+                          val g = r * 0.25f
+                          c.drawLine(cx - r, cy, cx - g, cy, p)
+                          c.drawLine(cx + g, cy, cx + r, cy, p)
+                          c.drawLine(cx, cy - r, cx, cy - g, p)
+                          c.drawLine(cx, cy + g, cx, cy + r, p)
+                      }
+                      1 -> {
+                          p.style = Paint.Style.FILL_AND_STROKE
+                          c.drawCircle(cx, cy, r * 0.25f, p)
+                      }
+                      2 -> c.drawCircle(cx, cy, r * 0.8f, p)
+                      3 -> {
+                          c.drawLine(cx - r, cy, cx + r, cy, p)
+                          c.drawLine(cx, cy - r, cx, cy + r, p)
+                      }
+                      4 -> {
+                          val d = r * 0.7f
+                          c.drawLine(cx - d, cy - d, cx + d, cy + d, p)
+                          c.drawLine(cx - d, cy + d, cx + d, cy - d, p)
+                      }
+                      5 -> {
+                          c.drawCircle(cx, cy, r * 0.8f, p)
+                          p.style = Paint.Style.FILL_AND_STROKE
+                          c.drawCircle(cx, cy, r * 0.12f, p)
+                      }
+                      6 -> {
+                          val path = Path()
+                          path.moveTo(cx, cy - r)
+                          path.lineTo(cx + r, cy)
+                          path.lineTo(cx, cy + r)
+                          path.lineTo(cx - r, cy)
+                          path.close()
+                          c.drawPath(path, p)
+                      }
+                      else -> {
+                          val g = r * 0.55f
+                          c.drawCircle(cx, cy, g, p)
+                          c.drawLine(cx - r, cy, cx - g, cy, p)
+                          c.drawLine(cx + g, cy, cx + r, cy, p)
+                          c.drawLine(cx, cy - r, cx, cy - g, p)
+                          c.drawLine(cx, cy + g, cx, cy + r, p)
+                      }
+                  }
+              }
+          }
+
+          class CursorView(ctx: Context) : View(ctx) {
+              var style: Int = 0
+                  set(v) {
+                      field = v
+                      invalidate()
+                  }
+
+              var color: Int = Color.WHITE
+                  set(v) {
+                      field = v
+                      invalidate()
+                  }
+
+              var custom: Bitmap? = null
+                  set(v) {
+                      field = v
+                      invalidate()
+                  }
+
+              private val bp = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(canvas: Canvas) {
+                  val bm = custom
+                  if (bm != null) {
+                      val s = minOf(width.toFloat() / bm.width, height.toFloat() / bm.height)
+                      val w = bm.width * s
+                      val h = bm.height * s
+                      val dst = RectF((width - w) / 2f, (height - h) / 2f, (width + w) / 2f, (height + h) / 2f)
+                      canvas.drawBitmap(bm, null, dst, bp)
+                  } else {
+                      CursorShapes.draw(canvas, style, color, width.toFloat(), height.toFloat())
+                  }
+              }
+          }
+
+          class MarkerView(ctx: Context) : View(ctx) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(canvas: Canvas) {
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = minOf(cx, cy) - 4f
+                  p.style = Paint.Style.FILL
+                  p.color = Color.argb(70, 255, 0, 0)
+                  canvas.drawCircle(cx, cy, r, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 4f
+                  p.color = Color.RED
+                  canvas.drawCircle(cx, cy, r, p)
+                  canvas.drawLine(cx - r, cy, cx + r, cy, p)
+                  canvas.drawLine(cx, cy - r, cx, cy + r, p)
+              }
+          }
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/CursorStore.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.net.Uri
+          import java.io.File
+          import java.io.FileOutputStream
+
+          object CursorStore {
+              private fun srcFile(c: Context) = File(c.filesDir, "cursor_src.png")
+
+              fun hasSource(c: Context): Boolean = srcFile(c).exists()
+
+              fun saveFromUri(c: Context, uri: Uri): Boolean {
+                  return try {
+                      val bm = decode(c, uri, 256) ?: return false
+                      FileOutputStream(srcFile(c)).use { bm.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun decode(c: Context, uri: Uri, max: Int): Bitmap? {
+                  val o = BitmapFactory.Options()
+                  o.inJustDecodeBounds = true
+                  c.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o) }
+                  var s = 1
+                  while (o.outWidth / s > max * 2 || o.outHeight / s > max * 2) s *= 2
+                  val o2 = BitmapFactory.Options()
+                  o2.inSampleSize = s
+                  val raw = c.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o2) }
+                      ?: return null
+                  val k = minOf(1f, max.toFloat() / maxOf(raw.width, raw.height))
+                  if (k >= 1f) return raw
+                  return Bitmap.createScaledBitmap(
+                      raw,
+                      maxOf(1, (raw.width * k).toInt()),
+                      maxOf(1, (raw.height * k).toInt()),
+                      true
+                  )
+              }
+
+              /** Baca gambar kursor dan hapus latar otomatis. tol = toleransi warna (5..90). */
+              fun load(c: Context, tol: Int): Bitmap? {
+                  val f = srcFile(c)
+                  if (!f.exists()) return null
+                  val bm = BitmapFactory.decodeFile(f.absolutePath) ?: return null
+                  return removeBg(bm, tol)
+              }
+
+              private fun removeBg(src: Bitmap, tol: Int): Bitmap {
+                  val w = src.width
+                  val h = src.height
+                  val px = IntArray(w * h)
+                  src.getPixels(px, 0, w, 0, 0, w, h)
+
+                  // Kalau PNG sudah punya bagian transparan, cukup dipotong rapi.
+                  var see = 0
+                  for (p in px) if (Color.alpha(p) < 200) see++
+                  if (see > px.size / 50) return crop(src)
+
+                  // Warna latar = rata-rata 4 sudut gambar.
+                  val cs = intArrayOf(px[0], px[w - 1], px[(h - 1) * w], px[h * w - 1])
+                  var br = 0
+                  var bgc = 0
+                  var bb = 0
+                  for (p in cs) {
+                      br += Color.red(p)
+                      bgc += Color.green(p)
+                      bb += Color.blue(p)
+                  }
+                  br /= 4
+                  bgc /= 4
+                  bb /= 4
+
+                  val t = tol * 2.5f
+                  val thr = (t * t).toInt()
+                  val seen = BooleanArray(w * h)
+                  val q = IntArray(w * h)
+                  var head = 0
+                  var tail = 0
+
+                  fun push(i: Int) {
+                      if (seen[i]) return
+                      val p = px[i]
+                      val dr = Color.red(p) - br
+                      val dg = Color.green(p) - bgc
+                      val db = Color.blue(p) - bb
+                      if (dr * dr + dg * dg + db * db <= thr) {
+                          seen[i] = true
+                          q[tail++] = i
+                      }
+                  }
+
+                  // Mulai dari semua piksel tepi, lalu sebar ke piksel yang warnanya mirip latar.
+                  for (x in 0 until w) {
+                      push(x)
+                      push((h - 1) * w + x)
+                  }
+                  for (y in 0 until h) {
+                      push(y * w)
+                      push(y * w + w - 1)
+                  }
+                  while (head < tail) {
+                      val i = q[head++]
+                      val x = i % w
+                      val y = i / w
+                      if (x > 0) push(i - 1)
+                      if (x < w - 1) push(i + 1)
+                      if (y > 0) push(i - w)
+                      if (y < h - 1) push(i + w)
+                  }
+
+                  for (i in px.indices) if (seen[i]) px[i] = 0
+                  val out = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+                  return crop(out)
+              }
+
+              private fun crop(b: Bitmap): Bitmap {
+                  val w = b.width
+                  val h = b.height
+                  val px = IntArray(w * h)
+                  b.getPixels(px, 0, w, 0, 0, w, h)
+                  var x0 = w
+                  var y0 = h
+                  var x1 = -1
+                  var y1 = -1
+                  for (y in 0 until h) {
+                      for (x in 0 until w) {
+                          if (Color.alpha(px[y * w + x]) > 10) {
+                              if (x < x0) x0 = x
+                              if (x > x1) x1 = x
+                              if (y < y0) y0 = y
+                              if (y > y1) y1 = y
+                          }
+                      }
+                  }
+                  if (x1 < 0) return b
+                  return Bitmap.createBitmap(b, x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+              }
+          }
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/TapService.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          class TapService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: TapService? = null
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              /** Tap satu kali di (x, y) layar. done() dipanggil setelah gesture selesai/batal. */
+              fun tap(x: Float, y: Float, done: () -> Unit) {
+                  val path = Path()
+                  path.moveTo(x, y)
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 30)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  val ok = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                      override fun onCompleted(gestureDescription: GestureDescription?) {
+                          done()
+                      }
+
+                      override fun onCancelled(gestureDescription: GestureDescription?) {
+                          done()
+                      }
+                  }, null)
+                  if (!ok) done()
+              }
+          }
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/PickActivity.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Toast
+
+          class PickActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val i = Intent(Intent.ACTION_GET_CONTENT)
+                  i.type = "image/*"
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/png", "image/jpeg"))
+                  startActivityForResult(i, 7)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val uri = data?.data
+                  if (resultCode == RESULT_OK && uri != null) {
+                      if (CursorStore.saveFromUri(this, uri)) {
+                          Prefs.put(this, "custom", true)
+                          if (OverlayService.running) {
+                              startService(Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_RELOAD))
+                          }
+                      } else {
+                          Toast.makeText(this, "Gambar gagal dibaca", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  finish()
+              }
+          }
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/MainActivity.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  val pad = dp(16)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  val title = TextView(this)
+                  title.text = "Pixel Panel"
+                  title.textSize = 24f
+                  root.addView(title)
+
+                  status = TextView(this)
+                  status.textSize = 14f
+                  status.setPadding(0, dp(8), 0, dp(8))
+                  root.addView(status)
+
+                  root.addView(button("1. Izinkan tampil di atas aplikasi lain") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  })
+                  root.addView(button("2. Aktifkan Aksesibilitas (untuk Auto Shoot)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  root.addView(button("3. Mulai Panel Melayang") { startPanel() })
+                  root.addView(button("Hentikan Panel") {
+                      stopService(Intent(this, OverlayService::class.java))
+                      refresh()
+                  })
+
+                  val help = TextView(this)
+                  help.textSize = 13f
+                  help.setPadding(0, dp(16), 0, 0)
+                  help.text = "Cara pakai:\n" +
+                      "• Setelah Mulai, panel kecil muncul di layar. Geser lewat judulnya, tombol – untuk melipat.\n" +
+                      "• Kursor putih ada di tengah layar. Ganti bentuk, warna, ukuran, atau upload gambar PNG/JPG (latar dihapus otomatis).\n" +
+                      "• Auto Shoot: tampilkan titik merah, geser ke tombol tembak, lalu nyalakan Auto Shoot. App akan tap otomatis di titik itu.\n" +
+                      "• Kalau tombol Aksesibilitas abu-abu (Android 13+): Info Aplikasi → ⋮ → Izinkan setelan terbatas."
+                  root.addView(help)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ov = if (Settings.canDrawOverlays(this)) "✔" else "✘"
+                  val ac = if (TapService.instance != null) "✔" else "✘"
+                  val pn = if (OverlayService.running) "aktif" else "mati"
+                  status.text = "Izin overlay: $ov\nAksesibilitas: $ac\nPanel: $pn"
+              }
+
+              private fun startPanel() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Izinkan overlay dulu (langkah 1)", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val i = Intent(this, OverlayService::class.java)
+                  if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                  moveTaskToBack(true)
+              }
+
+              private fun button(t: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = t
+                  b.isAllCaps = false
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          }
+          PP_EOF
+          cat > app/src/main/java/com/pixelpanel/OverlayService.kt <<'PP_EOF'
+          package com.pixelpanel
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.ContextThemeWrapper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class OverlayService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.pixelpanel.STOP"
+                  const val ACTION_RELOAD = "com.pixelpanel.RELOAD"
+
+                  @Volatile
+                  var running = false
+
+                  private val BASE_FLAGS =
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+              }
+
+              private lateinit var wm: WindowManager
+              private lateinit var ui: Context
+              private var ready = false
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var cursor: CursorView? = null
+              private var cursorParams: WindowManager.LayoutParams? = null
+              private var customBmp: Bitmap? = null
+
+              private var panel: LinearLayout? = null
+              private var panelParams: WindowManager.LayoutParams? = null
+              private var styleRow: LinearLayout? = null
+              private var shootSwitch: Switch? = null
+
+              private var marker: MarkerView? = null
+              private var markerParams: WindowManager.LayoutParams? = null
+              private var markerShown = false
+              private var shooting = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  startForeground(1, buildNotification())
+                  if (!Settings.canDrawOverlays(this)) {
+                      stopSelf()
+                      return
+                  }
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  ui = ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault)
+                  buildCursor()
+                  buildMarker()
+                  buildPanel()
+                  reloadCustom()
+                  refreshStyleRow()
+                  ready = true
+                  running = true
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> {
+                          stopSelf()
+                          return START_NOT_STICKY
+                      }
+                      ACTION_RELOAD -> {
+                          if (ready) {
+                              reloadCustom()
+                              refreshStyleRow()
+                          }
+                      }
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  shooting = false
+                  handler.removeCallbacksAndMessages(null)
+                  if (::wm.isInitialized) {
+                      for (v in listOf<View?>(cursor, panel, marker)) {
+                          if (v != null) {
+                              try {
+                                  wm.removeView(v)
+                              } catch (e: Exception) {
+                              }
+                          }
+                      }
+                  }
+                  running = false
+                  super.onDestroy()
+              }
+
+              // ---------- util ----------
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun overlayType(): Int =
+                  if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else WindowManager.LayoutParams.TYPE_PHONE
+
+              private fun buildNotification(): Notification {
+                  val chId = "pp"
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(
+                          NotificationChannel(chId, "Pixel Panel", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val stop = PendingIntent.getService(
+                      this,
+                      0,
+                      Intent(this, OverlayService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this)
+                  b.setSmallIcon(android.R.drawable.ic_menu_view)
+                  b.setContentTitle("Pixel Panel aktif")
+                  b.setContentText("Ketuk untuk menghentikan")
+                  b.setContentIntent(stop)
+                  return b.build()
+              }
+
+              private fun text(t: String, size: Float): TextView {
+                  val v = TextView(ui)
+                  v.text = t
+                  v.textSize = size
+                  v.setTextColor(Color.WHITE)
+                  return v
+              }
+
+              private fun btn(t: String, onClick: () -> Unit): Button {
+                  val b = Button(ui)
+                  b.text = t
+                  b.isAllCaps = false
+                  b.textSize = 12f
+                  b.minHeight = 0
+                  b.minimumHeight = 0
+                  b.minWidth = 0
+                  b.minimumWidth = 0
+                  b.setPadding(dp(10), dp(6), dp(10), dp(6))
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun sw(t: String, checked: Boolean, onChange: (Boolean) -> Unit): Switch {
+                  val s = Switch(ui)
+                  s.text = t
+                  s.setTextColor(Color.WHITE)
+                  s.isChecked = checked
+                  s.setOnCheckedChangeListener { _, b -> onChange(b) }
+                  return s
+              }
+
+              private fun seek(
+                  min: Int,
+                  max: Int,
+                  value: Int,
+                  onChange: (Int) -> Unit = {},
+                  onStop: (Int) -> Unit = {}
+              ): SeekBar {
+                  val s = SeekBar(ui)
+                  s.max = max - min
+                  s.progress = value - min
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          if (fromUser) onChange(p + min)
+                      }
+
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+
+                      override fun onStopTrackingTouch(sb: SeekBar?) {
+                          onStop((sb?.progress ?: 0) + min)
+                      }
+                  })
+                  return s
+              }
+
+              private fun makeDraggable(
+                  handle: View,
+                  target: View,
+                  lpOf: () -> WindowManager.LayoutParams?,
+                  onUp: () -> Unit
+              ) {
+                  var sx = 0
+                  var sy = 0
+                  var tx = 0f
+                  var ty = 0f
+                  handle.setOnTouchListener { _, e ->
+                      val lp = lpOf()
+                      if (lp == null) {
+                          false
+                      } else {
+                          when (e.actionMasked) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  sx = lp.x
+                                  sy = lp.y
+                                  tx = e.rawX
+                                  ty = e.rawY
+                                  true
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  lp.x = sx + (e.rawX - tx).toInt()
+                                  lp.y = sy + (e.rawY - ty).toInt()
+                                  wm.updateViewLayout(target, lp)
+                                  true
+                              }
+                              MotionEvent.ACTION_UP -> {
+                                  onUp()
+                                  true
+                              }
+                              else -> true
+                          }
+                      }
+                  }
+              }
+
+              // ---------- kursor ----------
+
+              private fun buildCursor() {
+                  val s = dp(45)
+                  val v = CursorView(ui)
+                  val lp = WindowManager.LayoutParams(
+                      s,
+                      s,
+                      overlayType(),
+                      BASE_FLAGS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.CENTER
+                  cursor = v
+                  cursorParams = lp
+                  wm.addView(v, lp)
+              }
+
+              private fun reloadCustom() {
+                  customBmp = if (CursorStore.hasSource(this)) {
+                      CursorStore.load(this, Prefs.int(this, "tol", 40))
+                  } else {
+                      null
+                  }
+                  applyLook()
+              }
+
+              private fun applyLook() {
+                  val v = cursor ?: return
+                  v.visibility = if (Prefs.bool(this, "cursorOn", true)) View.VISIBLE else View.GONE
+                  v.style = Prefs.int(this, "style", 0)
+                  v.color = Prefs.int(this, "color", Color.WHITE)
+                  v.custom = if (Prefs.bool(this, "custom", false)) customBmp else null
+                  val s = dp(Prefs.int(this, "size", 45))
+                  val lp = cursorParams
+                  if (lp != null) {
+                      lp.width = s
+                      lp.height = s
+                      wm.updateViewLayout(v, lp)
+                  }
+              }
+
+              // ---------- titik auto shoot ----------
+
+              private fun buildMarker() {
+                  val dm = resources.displayMetrics
+                  val size = dp(56)
+                  val v = MarkerView(ui)
+                  val lp = WindowManager.LayoutParams(
+                      size,
+                      size,
+                      overlayType(),
+                      BASE_FLAGS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  val mx = Prefs.int(this, "mx", -1)
+                  val my = Prefs.int(this, "my", -1)
+                  lp.x = if (mx >= 0) mx else (dm.widthPixels * 0.75f).toInt() - size / 2
+                  lp.y = if (my >= 0) my else dm.heightPixels / 2 - size / 2
+                  v.visibility = View.INVISIBLE
+                  marker = v
+                  markerParams = lp
+                  wm.addView(v, lp)
+                  makeDraggable(v, v, { markerParams }, {
+                      val p = markerParams
+                      if (p != null) {
+                          Prefs.put(this, "mx", p.x)
+                          Prefs.put(this, "my", p.y)
+                      }
+                  })
+              }
+
+              private fun updateMarker() {
+                  val v = marker ?: return
+                  val lp = markerParams ?: return
+                  v.visibility = if (markerShown) View.VISIBLE else View.INVISIBLE
+                  lp.flags = if (markerShown && !shooting) {
+                      BASE_FLAGS
+                  } else {
+                      BASE_FLAGS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  }
+                  wm.updateViewLayout(v, lp)
+              }
+
+              private fun markerCenter(): Pair<Float, Float> {
+                  val v = marker
+                  val lp = markerParams
+                  if (v != null && v.width > 0) {
+                      val loc = IntArray(2)
+                      v.getLocationOnScreen(loc)
+                      return Pair(loc[0] + v.width / 2f, loc[1] + v.height / 2f)
+                  }
+                  val half = (lp?.width ?: 0) / 2f
+                  return Pair((lp?.x ?: 0) + half, (lp?.y ?: 0) + half)
+              }
+
+              private val shootRunnable = object : Runnable {
+                  override fun run() {
+                      if (!shooting) return
+                      val svc = TapService.instance
+                      if (svc == null) {
+                          stopShoot()
+                          return
+                      }
+                      val p = markerCenter()
+                      val self = this
+                      svc.tap(p.first, p.second) {
+                          if (shooting) {
+                              val gap = Prefs.int(this@OverlayService, "interval", 100)
+                              handler.postDelayed(self, gap.toLong())
+                          }
+                      }
+                  }
+              }
+
+              private fun startShoot() {
+                  if (TapService.instance == null) {
+                      Toast.makeText(this, "Aktifkan Aksesibilitas 'Pixel Panel Auto Shoot' dulu", Toast.LENGTH_LONG).show()
+                      val i = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(i)
+                      shootSwitch?.isChecked = false
+                      return
+                  }
+                  shooting = true
+                  updateMarker()
+                  handler.removeCallbacks(shootRunnable)
+                  handler.post(shootRunnable)
+              }
+
+              private fun stopShoot() {
+                  shooting = false
+                  handler.removeCallbacks(shootRunnable)
+                  updateMarker()
+                  val s = shootSwitch
+                  if (s != null && s.isChecked) s.isChecked = false
+              }
+
+              // ---------- panel ----------
+
+              private fun decorate(v: View, selected: Boolean) {
+                  val d = GradientDrawable()
+                  d.setColor(Color.parseColor("#33FFFFFF"))
+                  d.cornerRadius = dp(8).toFloat()
+                  if (selected) d.setStroke(dp(2), Color.parseColor("#4FC3F7"))
+                  v.background = d
+              }
+
+              private fun refreshStyleRow() {
+                  val row = styleRow ?: return
+                  row.removeAllViews()
+                  val cur = Prefs.int(this, "style", 0)
+                  val custom = Prefs.bool(this, "custom", false)
+                  val col = Prefs.int(this, "color", Color.WHITE)
+                  for (i in 0 until CursorShapes.COUNT) {
+                      val v = CursorView(ui)
+                      v.style = i
+                      v.color = col
+                      decorate(v, !custom && cur == i)
+                      v.setOnClickListener {
+                          Prefs.put(this, "style", i)
+                          Prefs.put(this, "custom", false)
+                          applyLook()
+                          refreshStyleRow()
+                      }
+                      val lp = LinearLayout.LayoutParams(dp(40), dp(40))
+                      lp.rightMargin = dp(6)
+                      row.addView(v, lp)
+                  }
+                  val bmp = customBmp
+                  if (bmp != null) {
+                      val v = CursorView(ui)
+                      v.custom = bmp
+                      decorate(v, custom)
+                      v.setOnClickListener {
+                          Prefs.put(this, "custom", true)
+                          applyLook()
+                          refreshStyleRow()
+                      }
+                      val lp = LinearLayout.LayoutParams(dp(40), dp(40))
+                      lp.rightMargin = dp(6)
+                      row.addView(v, lp)
+                  }
+              }
+
+              private fun buildPanel() {
+                  val dm = resources.displayMetrics
+
+                  val root = LinearLayout(ui)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(10), dp(8), dp(10), dp(10))
+                  val bg = GradientDrawable()
+                  bg.setColor(Color.parseColor("#E6202028"))
+                  bg.cornerRadius = dp(14).toFloat()
+                  root.background = bg
+
+                  val body = LinearLayout(ui)
+                  body.orientation = LinearLayout.VERTICAL
+                  val scroll = ScrollView(ui)
+                  scroll.addView(body)
+
+                  val header = LinearLayout(ui)
+                  header.orientation = LinearLayout.HORIZONTAL
+                  header.gravity = Gravity.CENTER_VERTICAL
+                  val title = text("⠿  Pixel Panel (geser di sini)", 14f)
+                  header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  val toggle = btn("–") {
+                      scroll.visibility = if (scroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                  }
+                  header.addView(
+                      toggle,
+                      LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  )
+                  root.addView(header)
+
+                  fun add(v: View) {
+                      val lp = LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT
+                      )
+                      lp.topMargin = dp(6)
+                      body.addView(v, lp)
+                  }
+
+                  // Kursor
+                  add(sw("Kursor aktif", Prefs.bool(this, "cursorOn", true)) { on ->
+                      Prefs.put(this, "cursorOn", on)
+                      applyLook()
+                  })
+
+                  add(text("Bentuk kursor", 12f))
+                  val sr = LinearLayout(ui)
+                  sr.orientation = LinearLayout.HORIZONTAL
+                  styleRow = sr
+                  val hs = HorizontalScrollView(ui)
+                  hs.addView(sr)
+                  add(hs)
+                  refreshStyleRow()
+
+                  add(text("Warna (bentuk bawaan)", 12f))
+                  val colorRow = LinearLayout(ui)
+                  colorRow.orientation = LinearLayout.HORIZONTAL
+                  val colors = intArrayOf(Color.WHITE, Color.RED, Color.GREEN, Color.CYAN, Color.YELLOW, Color.MAGENTA)
+                  for (c in colors) {
+                      val d = View(ui)
+                      val g = GradientDrawable()
+                      g.shape = GradientDrawable.OVAL
+                      g.setColor(c)
+                      g.setStroke(dp(1), Color.GRAY)
+                      d.background = g
+                      d.setOnClickListener {
+                          Prefs.put(this, "color", c)
+                          applyLook()
+                          refreshStyleRow()
+                      }
+                      val lp = LinearLayout.LayoutParams(dp(28), dp(28))
+                      lp.rightMargin = dp(8)
+                      colorRow.addView(d, lp)
+                  }
+                  add(colorRow)
+
+                  val sz = Prefs.int(this, "size", 45)
+                  val szLabel = text("Ukuran: $sz", 12f)
+                  add(szLabel)
+                  add(seek(20, 160, sz, onChange = { v ->
+                      Prefs.put(this, "size", v)
+                      szLabel.text = "Ukuran: $v"
+                      applyLook()
+                  }))
+
+                  add(btn("Upload gambar kursor (PNG / JPG)") {
+                      val i = Intent(this, PickActivity::class.java)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(i)
+                  })
+                  add(text("Hapus latar otomatis (toleransi)", 12f))
+                  add(seek(5, 90, Prefs.int(this, "tol", 40), onStop = { v ->
+                      Prefs.put(this, "tol", v)
+                      reloadCustom()
+                      refreshStyleRow()
+                  }))
+
+                  // Auto shoot
+                  add(text("— Auto Shoot —", 13f))
+                  val shoot = sw("Auto shoot (tap otomatis)", false) { on ->
+                      if (on) startShoot() else stopShoot()
+                  }
+                  shootSwitch = shoot
+                  add(shoot)
+                  add(btn("Atur posisi tembak (tampil/sembunyi titik merah)") {
+                      markerShown = !markerShown
+                      updateMarker()
+                  })
+                  val iv = Prefs.int(this, "interval", 100)
+                  val ivLabel = text("Jeda tap: $iv ms", 12f)
+                  add(ivLabel)
+                  add(seek(30, 1000, iv, onChange = { v ->
+                      Prefs.put(this, "interval", v)
+                      ivLabel.text = "Jeda tap: $v ms"
+                  }))
+
+                  add(btn("Tutup panel") { stopSelf() })
+
+                  val h = minOf(dp(380), (dm.heightPixels * 0.6f).toInt())
+                  root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h))
+
+                  val lp = WindowManager.LayoutParams(
+                      dp(260),
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      overlayType(),
+                      BASE_FLAGS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = dp(12)
+                  lp.y = dp(40)
+                  panel = root
+                  panelParams = lp
+                  wm.addView(root, lp)
+                  makeDraggable(header, root, { panelParams }, {})
+              }
+          }
+          PP_EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PixelPanel-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
